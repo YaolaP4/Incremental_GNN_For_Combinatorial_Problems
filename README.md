@@ -45,6 +45,8 @@ The benchmark reports average computation time, conflicts, channel changes, and 
 - Greedy Repair
 - Local Search SA
 
+A small GitHub Actions smoke test runs on pushes to `main` and checks the real PyTorch Geometric forward/backward path, conflict repair, and an end-to-end benchmark update.
+
 ## Files
 
 - `dynamic_gnn.py` — model, training, conflict repair, baselines, graph generation, and evaluation
