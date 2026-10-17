@@ -277,7 +277,7 @@ def conflict_aware_loss(
 
 
 def post_process_coloring(pred_colors, edge_index, max_colors=50):
-    """Repair every residual conflict, then assert validity."""
+    """Single greedy pass over nodes, followed by an all-edge validity assertion."""
     colors = pred_colors.detach().cpu().clone().long()
     edges = unique_undirected_edges(edge_index).detach().cpu()
     if edges.numel() == 0:
@@ -289,28 +289,19 @@ def post_process_coloring(pred_colors, edge_index, max_colors=50):
         adj[u].add(v)
         adj[v].add(u)
 
-    max_passes = max(1, n * 2)
-    for _ in range(max_passes):
-        conflicts = [(u, v) for u, v in edges.t().tolist() if colors[u] == colors[v]]
-        if not conflicts:
-            out = colors.to(pred_colors.device)
-            if count_conflicts(edge_index, out) != 0:
-                raise AssertionError("Conflict repair validation failed.")
-            return out
-
-        touched = set()
-        for u, v in conflicts:
-            node = u if len(adj[u]) >= len(adj[v]) else v
-            if node in touched:
-                continue
-            used = {int(colors[w]) for w in adj[node]}
+    for node in sorted(range(n), key=lambda x: len(adj[x]), reverse=True):
+        used = {int(colors[w]) for w in adj[node]}
+        if int(colors[node]) in used:
             replacement = next((c for c in range(max_colors) if c not in used), None)
             if replacement is None:
                 raise ValueError("max_colors is too small for conflict repair.")
             colors[node] = replacement
-            touched.add(node)
 
-    raise RuntimeError("Conflict repair did not converge.")
+    out = colors.to(pred_colors.device)
+    remaining = count_conflicts(edge_index, out)
+    if remaining != 0:
+        raise AssertionError(f"Conflict repair left {remaining} conflicts.")
+    return out
 
 
 def greedy_repair_until_valid(G, coloring, max_colors=50):
@@ -402,16 +393,25 @@ def simulated_annealing_coloring(
     final_temp=0.02,
     rng=None,
 ):
-    """Simulated annealing with cooling and Metropolis acceptance."""
+    """Simulated annealing with cooling, Metropolis acceptance, and local-score deltas."""
     rng = rng or random.Random(DEFAULT_SEED)
     current = init_coloring.copy()
     for node in G.nodes():
         current.setdefault(node, 0)
 
-    best = current.copy()
-    current_score = annealing_objective(G, current, init_coloring)
-    best_score = current_score
     nodes = list(G.nodes())
+    reference = init_coloring
+    color_counts = defaultdict(int)
+    for c in current.values():
+        color_counts[c] += 1
+
+    current_conflicts = count_dict_conflicts(G, current)
+    current_changes = num_color_changes(reference, current)
+    current_ncolors = sum(1 for n in color_counts.values() if n > 0)
+    current_score = 10_000 * current_conflicts + 10 * current_changes + current_ncolors
+
+    best = current.copy()
+    best_score = current_score
 
     for step in range(max(1, steps)):
         frac = step / max(1, steps - 1)
@@ -423,26 +423,48 @@ def simulated_annealing_coloring(
             if any(current[n] == current[v] for v in G.neighbors(n))
         ]
         node = rng.choice(conflicted if conflicted and rng.random() < 0.85 else nodes)
+        old_color = current[node]
 
-        used = {current[v] for v in G.neighbors(node)}
-        candidates = [c for c in range(max_colors) if c != current[node]]
+        active_colors = sorted(c for c, count in color_counts.items() if count > 0)
+        candidates = [c for c in active_colors if c != old_color]
+        new_color = next((c for c in range(max_colors) if color_counts[c] == 0), None)
+        if new_color is not None and new_color != old_color:
+            candidates.append(new_color)
         if not candidates:
             continue
 
+        used = {current[v] for v in G.neighbors(node)}
         valid = [c for c in candidates if c not in used]
         proposal = rng.choice(valid if valid and rng.random() < 0.9 else candidates)
 
-        candidate = current.copy()
-        candidate[node] = proposal
-        score = annealing_objective(G, candidate, init_coloring)
-        delta = score - current_score
+        old_conflicts_at_node = sum(current[v] == old_color for v in G.neighbors(node))
+        new_conflicts_at_node = sum(current[v] == proposal for v in G.neighbors(node))
+        delta_conflicts = new_conflicts_at_node - old_conflicts_at_node
+
+        old_changed = int(old_color != reference.get(node, old_color))
+        new_changed = int(proposal != reference.get(node, old_color))
+        delta_changes = new_changed - old_changed
+
+        delta_colors = 0
+        if color_counts[old_color] == 1:
+            delta_colors -= 1
+        if color_counts[proposal] == 0:
+            delta_colors += 1
+
+        delta = 10_000 * delta_conflicts + 10 * delta_changes + delta_colors
 
         if delta <= 0 or rng.random() < math.exp(-delta / max(temp, 1e-9)):
-            current = candidate
-            current_score = score
-            if score < best_score:
-                best = candidate.copy()
-                best_score = score
+            current[node] = proposal
+            color_counts[old_color] -= 1
+            color_counts[proposal] += 1
+            current_conflicts += delta_conflicts
+            current_changes += delta_changes
+            current_ncolors += delta_colors
+            current_score += delta
+
+            if current_score < best_score:
+                best = current.copy()
+                best_score = current_score
 
     return greedy_repair_until_valid(G, best, max_colors)
 
@@ -548,7 +570,7 @@ def train_static_model(model, processor, graphs, epochs=20, lr=1e-3):
                 logits,
                 data.y,
                 data.edge_index,
-                conflict_weight=min(25.0 + 3.0 * epoch, 100.0),
+                conflict_weight=min(50.0 + 3.0 * epoch, 110.0),
             )
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 5.0)
