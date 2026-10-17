@@ -1,0 +1,84 @@
+name: smoke-test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install torch torch-geometric networkx numpy scipy tqdm
+      - name: Compile
+        run: python -m py_compile dynamic_gnn.py
+      - name: Run smoke tests
+        run: |
+          python - <<'PY'
+          import random
+          import networkx as nx
+          import torch
+
+          from dynamic_gnn import (
+              ConflictAwareDynamicGNN,
+              DynamicGraphProcessor,
+              benchmark_graph_safe,
+              conflict_aware_loss,
+              count_conflicts,
+              graph_to_edge_index,
+              post_process_coloring,
+              sample_updates,
+              set_seed,
+          )
+
+          set_seed(42)
+          device = torch.device('cpu')
+
+          # Exact regression for the old every-other-edge conflict bug.
+          G = nx.path_graph(5)
+          edge_index = graph_to_edge_index(G, device)
+          colors = torch.tensor([0, 1, 1, 0, 0])
+          assert count_conflicts(edge_index, colors) == 2
+          repaired = post_process_coloring(colors, edge_index, max_colors=5)
+          assert count_conflicts(edge_index, repaired) == 0
+
+          # Real PyG model forward/backward and incremental path.
+          G = nx.erdos_renyi_graph(30, 0.12, seed=7)
+          processor = DynamicGraphProcessor(max_colors=12, device=device)
+          data = processor.process_static(G)
+          model = ConflictAwareDynamicGNN(max_colors=12, hidden=16, gat_heads=2).to(device)
+          logits = model(data)
+          assert logits.shape == (30, 12)
+          loss = conflict_aware_loss(logits, data.y, data.edge_index, conflict_weight=10.0)
+          loss.backward()
+
+          previous = processor.last_coloring.copy()
+          updates = sample_updates(processor.last_graph, random.Random(9), n_changes=4, add_probability=0.70)
+          data2 = processor.process_incremental(updates, prev_coloring=previous)
+          with torch.no_grad():
+              pred = post_process_coloring(model(data2).argmax(dim=1), data2.edge_index, max_colors=12)
+          assert count_conflicts(data2.edge_index, pred) == 0
+
+          # End-to-end benchmark smoke test. Every method must return a valid coloring.
+          rows = benchmark_graph_safe(
+              model,
+              nx.erdos_renyi_graph(35, 0.10, seed=11),
+              device=device,
+              max_colors=12,
+              update_rounds=2,
+              seed=13,
+          )
+          assert rows
+          assert all(row['conflicts'] == 0 for row in rows)
+          assert {row['method'] for row in rows} == {
+              'GNN', 'DSATUR', 'Welsh-Powell', 'Greedy Repair', 'Local Search SA'
+          }
+          print('smoke tests passed')
+          PY
