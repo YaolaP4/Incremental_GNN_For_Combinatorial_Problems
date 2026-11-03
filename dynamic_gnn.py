@@ -188,7 +188,8 @@ class DynamicGraphProcessor:
         self.last_coloring = teacher.copy()
         return data
 
-    def process_incremental(self, updates, prev_coloring=None):
+    def process_incremental(self, updates, prev_coloring=None, compute_teacher=True):
+        """Apply an update batch; skip training-label computation during inference."""
         if self.last_graph is None:
             raise RuntimeError("Call process_static before process_incremental.")
 
@@ -212,14 +213,22 @@ class DynamicGraphProcessor:
             else:
                 raise ValueError(f"Unknown update type: {upd['type']}")
 
-        previous = (prev_coloring or self.last_coloring).copy()
-        teacher = greedy_repair_until_valid(G, previous, self.max_colors)
+        previous = (
+            self.last_coloring if prev_coloring is None else prev_coloring
+        ).copy()
+        # Training targets must never be computed as part of inference timing.
+        # At inference, data.y is unused and the prior labels are a placeholder.
+        target = (
+            greedy_repair_until_valid(G, previous, self.max_colors)
+            if compute_teacher
+            else previous.copy()
+        )
         x_base = self._base_features(G, affected)
-        data = self._make_data(G, x_base, previous, teacher, affected)
+        data = self._make_data(G, x_base, previous, target, affected)
 
         self.base_feature_cache = x_base.clone()
         self.last_graph = G.copy()
-        self.last_coloring = teacher.copy()
+        self.last_coloring = target.copy()
         return data
 
 
@@ -470,7 +479,12 @@ def simulated_annealing_coloring(
 
 
 def sample_updates(G, rng, n_changes=None, add_probability=0.70):
-    n_changes = n_changes or rng.randint(3, 5)
+    if n_changes is None:
+        n_changes = rng.randint(3, 5)
+    if n_changes < 0:
+        raise ValueError("n_changes must be nonnegative")
+    if G.number_of_nodes() < 2:
+        return []
     work = G.copy()
     updates = []
 
@@ -649,10 +663,19 @@ def train_incremental_model(model, processor, graphs, epochs=30, lr=1e-3, seed=2
 
 @torch.no_grad()
 def gnn_step(model, processor, updates, previous):
-    data = processor.process_incremental(updates, prev_coloring=previous)
+    """Measure the full GNN update path, including feature prep and repair."""
+    if processor.device.type == "cuda":
+        torch.cuda.synchronize(processor.device)
     start = time.perf_counter()
+    data = processor.process_incremental(
+        updates, prev_coloring=previous, compute_teacher=False
+    )
     logits = model(data)
-    pred = post_process_coloring(logits.argmax(dim=1), data.edge_index, processor.max_colors)
+    pred = post_process_coloring(
+        logits.argmax(dim=1), data.edge_index, processor.max_colors
+    )
+    if processor.device.type == "cuda":
+        torch.cuda.synchronize(processor.device)
     elapsed_ms = (time.perf_counter() - start) * 1000.0
 
     coloring = tensor_to_coloring(data.nodes_list, pred)
@@ -669,6 +692,8 @@ def benchmark_graph_safe(
     seed=0,
 ):
     rng = random.Random(seed)
+    # Independent streams: annealing's random draws must not alter future updates.
+    sa_rng = random.Random(seed ^ 0x5EED)
     G = nx.convert_node_labels_to_integers(base_graph, ordering="default")
 
     common_initial = nx.coloring.greedy_color(G, strategy="DSATUR")
@@ -727,7 +752,7 @@ def benchmark_graph_safe(
             priors["Local Search SA"],
             max_colors=max_colors,
             steps=max(1000, min(4000, 4 * G.number_of_nodes())),
-            rng=rng,
+            rng=sa_rng,
         )
         results["Local Search SA"] = (sa, (time.perf_counter() - t0) * 1000.0)
         states["Local Search SA"] = sa
